@@ -8,6 +8,7 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Threading;
 using System.Threading.Tasks;
 using Akka.Actor;
 using Akka.Routing;
@@ -49,7 +50,7 @@ namespace Akka.Tests.Routing
         {
             private readonly TestLatch _doneLatch;
             private static AtomicCounter _counter;
-            private readonly Lazy<int> id = new Lazy<int>(() => _counter.GetAndIncrement()); 
+            private readonly Lazy<int> id = new Lazy<int>(() => _counter.GetAndIncrement());
 
             public RoundRobinPoolActor(TestLatch doneLatch, AtomicCounter counter)
             {
@@ -311,12 +312,77 @@ namespace Akka.Tests.Routing
         [Fact]
         public void RoundRobinRoutingLogic_must_not_throw_IndexOutOfRangeException_when_counter_wraps_to_be_negative()
         {
-            var routees = new[] { Routee.NoRoutee, Routee.NoRoutee, Routee.NoRoutee };
+            var routees = new[] {Routee.NoRoutee, Routee.NoRoutee, Routee.NoRoutee};
             var routingLogic = new RoundRobinRoutingLogic(int.MaxValue - 5);
             for (var i = 0; i < 10; i++)
             {
                 routingLogic.Select(i, routees);
             }
+        }
+
+        private class Parent : ReceiveActor
+        {
+            public Parent()
+            {
+                Receive<string>(m => InsultChild(), m => m.Equals("error"));
+            }
+
+            private void InsultChild()
+            {
+                Context.ActorOf(Props.Create(() => new MyCurrentMessageShouldBeCleared())).Tell("error");
+            }
+
+            protected override SupervisorStrategy SupervisorStrategy()
+            {
+                return new OneForOneStrategy(exc => Directive.Resume);
+            }
+        }
+
+        private class MyCurrentMessageShouldBeCleared : ReceiveActor
+        {
+            public MyCurrentMessageShouldBeCleared()
+            {
+                Receive<string>(m => HandleError(), m => m.Equals("error"));
+            }
+
+            private void HandleError()
+            {
+                throw new Exception("Test Exception");
+            }
+        }
+
+        [Fact(DisplayName = "Pooled Actor with Resume strategy must(???) clear child actor's CurrentMessage")]
+        public void RoundRobinPool_do_not_clearing_childs_currentMessage_after_resume()
+        {
+            var sys = Sys;
+            var commonOneForOneStrategy = new OneForOneStrategy(exc => Directive.Resume);
+            var defaultPoolConfig = new RoundRobinPool(1)
+                .WithSupervisorStrategy(commonOneForOneStrategy)
+                .WithDispatcher(CallingThreadDispatcher.Id);
+            var tstActor = sys.ActorOf(
+                Props.Create(() => new MyCurrentMessageShouldBeCleared())
+                    .WithDispatcher(CallingThreadDispatcher.Id)
+                    .WithRouter(defaultPoolConfig),
+                "tstActor");
+
+            tstActor.Tell("error");
+            Thread.Sleep(1500);
+
+            var child = ((RepointableActorRef) tstActor).Children.First();
+            Assert.Equal(((LocalActorRef) child).Cell.CurrentMessage, "error");
+        }
+
+        [Fact(DisplayName = "Local Actor with Resume strategy must(???) clear child actor's CurrentMessage")]
+        public void LocalActor_do_not_clearing_childs_currentMessage_after_resume()
+        {
+            var sys = Sys;
+            var parent = sys.ActorOf(Props.Create(() => new Parent()).WithDispatcher(CallingThreadDispatcher.Id));
+
+            parent.Tell("error");
+            Thread.Sleep(1500);
+
+            var child = ((ActorRefWithCell) parent).Children.First();
+            Assert.Equal(((LocalActorRef) child).Cell.CurrentMessage, "error");
         }
     }
 }
